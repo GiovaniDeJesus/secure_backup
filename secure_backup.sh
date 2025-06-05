@@ -1,142 +1,117 @@
 #!/usr/bin/env bash
+
+set -euo pipefail
+
 DATE=$(date +%Y-%m-%d_%H-%M-%S)
-FILE="backup_$DATE.tar.gz"
-BACKUP_FILE=$FILE
-function usage
- {
+FILENAME="backup_$DATE.tar.gz"
+BACKUP_FILE=$FILENAME
+
+# ------------------------- HELPERS -------------------------
+
+function usage {
   echo "Usage: $0 -s source -r destination [-e] [-k ssh_key] [-g gpg_key] [-t tmp_dir] [-c]"
   exit 1
 }
 
-function helpmessage
- {
-  echo "This script creates compressed and optionally encrypted backups, then sends them using rsync or rclone (for cloud)."
-  echo "Options:"
-  echo "  -s  Source path (required)"
-  echo "  -r  Remote destination in the format user@host:/path or provider:path for cloud (required)"
-  echo "  -e  Encrypt the backup using GPG (optional)"
-  echo "  -k  Path to SSH key for rsync (optional)"
-  echo "  -g  GPG public key ID (optional)"
-  echo "  -t  Temporary working directory (required)" 
-  echo "  -c  Use cloud transfer (rclone) instead of rsync (optional)"
-  echo "  -h  Show this help message"
+function helpmessage {
+  cat << EOF
+Usage: $0 -s <source> -r <remote> -t <tmp_dir> [options]
+
+Creates a compressed (and optionally encrypted) backup, transferred via rsync or rclone.
+
+Required:
+  -s  Source directory
+  -r  Remote destination (rsync: user@host:/path or rclone: remote:path)
+  -t  Temporary directory for working files
+
+Optional:
+  -e  Enable GPG encryption
+  -g  GPG public key ID (required if -e is used)
+  -k  SSH key for rsync
+  -c  Use rclone instead of rsync
+  -h  Display this help message
+EOF
   exit 0
 }
 
+# ---------------------- CORE ACTIONS -----------------------
 
-function compression
-{
-    if ! tar -czf "$TMP_DIR/$FILE" -C "$(dirname "$SRC_DIR")" "$(basename "$SRC_DIR")";
-    then
-        echo "-----The script failed at the compression stage, please check the directories names-----"
-    fi
+compress_backup() {
+  echo "📦 Compressing $SRC_DIR into $TMP_DIR/$FILENAME..."
+  tar -czf "$TMP_DIR/$FILENAME" -C "$(dirname "$SRC_DIR")" "$(basename "$SRC_DIR")"
 }
 
-function encryption 
-{
-    if ! gpg -r "$GPG_KEY" -e "$TMP_DIR/$FILE";
-    then
-        echo "-----The script failed at the encryption stage-----"
-        exit 1
-    fi
-    FILE="$FILE.gpg"
+encrypt_backup() {
+  echo "🔐 Encrypting backup with GPG key: $GPG_KEY"
+  gpg -r "$GPG_KEY" -e "$TMP_DIR/$FILENAME"
+  FILENAME="$FILENAME.gpg"
 }
 
-function backup_on_remote
-{
-    if [ -z "$SSH_KEY" ]; 
-    then
-       if  rsync -a -e "ssh -o BatchMode=yes" "$TMP_DIR"/"$FILE" "$REMOTE_TARGET";
-       then
-            echo "-----operation successful-----"
-        else 
-            echo "-----The script failed at the transfer stage-----"
-            exit 1
-        fi
-    else
-       if  rsync -a -e "ssh -i $SSH_KEY -o BatchMode=yes" "$TMP_DIR"/"$FILE" "$REMOTE_TARGET";
-        then
-            echo "-----operation successful-----"
-        else 
-            echo "-----The script failed at the transfer stage-----"
-            exit 1
-        fi
-    fi 
+transfer_backup_rsync() {
+  echo "🚀 Transferring via rsync to $REMOTE_TARGET..."
+  local ssh_opts="ssh -o BatchMode=yes"
+  [[ -n "${SSH_KEY:-}" ]] && ssh_opts+=" -i $SSH_KEY"
+
+  rsync -a -e "$ssh_opts" "$TMP_DIR/$FILENAME" "$REMOTE_TARGET"
 }
 
-function backup_on_cloud 
-{
-   if  rclone copy "$TMP_DIR"/"$FILE" "$REMOTE_TARGET";
-   then
-        echo "-----operation successful-----"
-    else 
-        echo "-----The script failed at the transfer stage-----"
-            exit 1
-    fi
+transfer_backup_rclone() {
+  echo "☁️ Transferring via rclone to $REMOTE_TARGET..."
+  rclone copy "$TMP_DIR/$FILENAME" "$REMOTE_TARGET"
 }
 
-function clean_up
-{
-    [ -f "$TMP_DIR"/"$FILE" ] && rm "$TMP_DIR"/"$FILE"
-    [ -f "$TMP_DIR"/"$BACKUP_FILE"  ] && rm "$TMP_DIR"/"$BACKUP_FILE"
+clean_up() {
+  echo "🧹 Cleaning up temporary files..."
+  rm -f "$TMP_DIR/$FILENAME" "$TMP_DIR/$BACKUP_FILE"
 }
 
-#Start Menu
+# ------------------------- ARG PARSING -------------------------
+
 while getopts "s:r:k:t:g:ceh" opt; do
   case "$opt" in
-    s) SRC_DIR="$OPTARG" ;;      
-    r) REMOTE_TARGET="$OPTARG" ;;  
-    k) SSH_KEY="$OPTARG" ;; 
-    t) TMP_DIR="$OPTARG" ;; 
+    s) SRC_DIR="$OPTARG" ;;
+    r) REMOTE_TARGET="$OPTARG" ;;
+    k) SSH_KEY="$OPTARG" ;;
+    t) TMP_DIR="$OPTARG" ;;
     g) GPG_KEY="$OPTARG" ;;
-    e) ENCRYPTION=TRUE ;;
-    c) CLOUD=TRUE ;;
+    e) ENCRYPTION=true ;;
+    c) CLOUD=true ;;
     h) helpmessage ;;
-    \?) usage ;;
+    *) usage ;;
   esac
 done
 
-# Check requirements
-for cmd in tar rsync; do
-  command -v $cmd >/dev/null 2>&1 || { echo "Error: $cmd is not installed."; exit 1; }
-done
+# --------------------- VALIDATION CHECKS ----------------------
 
-if [ "$ENCRYPTION" = "TRUE" ]; then
-  command -v gpg >/dev/null 2>&1 || { echo "Error: gpg is not installed."; exit 1; }
+[[ -z "${SRC_DIR:-}" || -z "${REMOTE_TARGET:-}" || -z "${TMP_DIR:-}" ]] && {
+  echo "❌ Missing required options: -s, -r, -t"
+  usage
+}
+
+command -v tar &>/dev/null || { echo "Error: 'tar' not found."; exit 1; }
+command -v rsync &>/dev/null || { echo "Error: 'rsync' not found."; exit 1; }
+
+if [[ "${ENCRYPTION:-}" == true ]]; then
+  [[ -z "${GPG_KEY:-}" ]] && { echo "❌ GPG key (-g) is required for encryption."; exit 1; }
+  command -v gpg &>/dev/null || { echo "Error: 'gpg' not found."; exit 1; }
 fi
 
-if [ "$CLOUD" = "TRUE" ]; then
-  command -v rclone >/dev/null 2>&1 || { echo "Error: rclone is not installed."; exit 1; }
+if [[ "${CLOUD:-}" == true ]]; then
+  command -v rclone &>/dev/null || { echo "Error: 'rclone' not found."; exit 1; }
 fi
 
-# Start the main function
+# ------------------------- MAIN LOGIC -------------------------
 
-if [ -z "$1" ]; then
-    usage
-fi
-if [ -z "$SRC_DIR" ] || [ -z "$REMOTE_TARGET" ] || [ -z "$TMP_DIR" ]; then
-  echo "Error: -s, -r and -t are required"
-  exit 1
-fi
+compress_backup
 
-# Calling the compression funtion
-compression
+[[ "${ENCRYPTION:-}" == true ]] && encrypt_backup
 
-# Check the encryption flag and call the function if needed
-if [ "$ENCRYPTION" = "TRUE" ]; then
-    if [ -n "$GPG_KEY" ]; then
-        encryption
-    else
-        echo "Encryption requested but GPG key (-g) is missing."
-        exit 1
-    fi
-fi
-
-# Sending the files
- if [ "$CLOUD" = "TRUE" ]; then
-    backup_on_cloud
+if [[ "${CLOUD:-}" == true ]]; then
+  transfer_backup_rclone
 else
-    backup_on_remote
+  transfer_backup_rsync
 fi
-# Cleaning the temporal working directory
+
 clean_up
+
+echo "✅ Backup completed successfully."
